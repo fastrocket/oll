@@ -277,6 +277,7 @@ def build_refinement_prompt(
         stdout = (execution.get("stdout") or "").strip()
         stderr = (execution.get("stderr") or "").strip()
         returncode = execution.get("returncode")
+        no_output = execution.get("no_output")
         if stdout:
             exec_lines.append("STDOUT:")
             exec_lines.append(stdout)
@@ -285,6 +286,10 @@ def build_refinement_prompt(
             exec_lines.append(stderr)
         if returncode not in (None, 0):
             exec_lines.append(f"Return code: {returncode}")
+        if no_output:
+            exec_lines.append(
+                "Program produced no observable output. Ensure the next version prints or otherwise emits measurable results."
+            )
         if len(exec_lines) == 1:
             exec_lines.append("No observable output.")
         parts.append("\n".join(exec_lines))
@@ -327,6 +332,7 @@ def build_retry_prompt(
         stdout = (execution.get("stdout") or "").strip()
         stderr = (execution.get("stderr") or "").strip()
         returncode = execution.get("returncode")
+        no_output = execution.get("no_output")
         if stdout:
             exec_lines.append("STDOUT:")
             exec_lines.append(stdout)
@@ -335,6 +341,10 @@ def build_retry_prompt(
             exec_lines.append(stderr)
         if returncode not in (None, 0):
             exec_lines.append(f"Return code: {returncode}")
+        if no_output:
+            exec_lines.append(
+                "Program produced no observable output. Ensure the next version prints or otherwise emits measurable results."
+            )
         if len(exec_lines) == 1:
             exec_lines.append("No observable output.")
         parts.append("\n".join(exec_lines))
@@ -444,6 +454,16 @@ def main() -> None:
                         file=sys.stderr,
                     )
                     execution_details = execute_python(output, timeout=args.timeout)
+                    if execution_details is not None:
+                        stdout_clean = (execution_details.get("stdout") or "").strip()
+                        stderr_clean = (execution_details.get("stderr") or "").strip()
+                        no_output = not stdout_clean and not stderr_clean
+                        execution_details["no_output"] = no_output
+                        if no_output:
+                            print(
+                                "[client] Execution produced no observable output; requesting visible results next attempt.",
+                                file=sys.stderr,
+                            )
                 else:
                     print(
                         "[client] Execution not requested (use --execute or set --count>1).",
@@ -459,7 +479,13 @@ def main() -> None:
                     else:
                         timeout_flag = execution_details.get("timeout")
                         returncode = execution_details.get("returncode")
-                        execution_failed = bool(timeout_flag) or returncode is None or returncode != 0
+                        no_output_flag = execution_details.get("no_output")
+                        execution_failed = (
+                            bool(timeout_flag)
+                            or returncode is None
+                            or returncode != 0
+                            or bool(no_output_flag)
+                        )
 
                 success = warning is None and not execution_failed
 
