@@ -13,6 +13,9 @@ import json
 import sys
 from typing import Any, Dict, Optional, Tuple
 
+import subprocess
+from subprocess import TimeoutExpired
+
 import requests
 
 CODER_MODEL = "qwen2.5-coder:14b"
@@ -105,8 +108,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=120.0,
-        help="HTTP request timeout in seconds.",
+        default=60.0,
+        help="Timeout in seconds for both the HTTP request and optional execution.",
     )
     parser.add_argument(
         "--system-prompt",
@@ -193,23 +196,29 @@ def ensure_pure_python(text: str) -> Tuple[str, Optional[str]]:
     return code, None
 
 
-def execute_python(code: str) -> None:
-    # Minimal sandbox: provide a curated set of safe builtins.
-    safe_builtins = {
-        "print": print,
-        "range": range,
-        "len": len,
-        "enumerate": enumerate,
-        "sum": sum,
-        "min": min,
-        "max": max,
-        "abs": abs,
-    }
-    env: Dict[str, Any] = {"__builtins__": safe_builtins}
+def execute_python(code: str, timeout: float) -> None:
+    """Execute code in an isolated Python subprocess."""
     try:
-        exec(code, env, env)
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"Execution error: {exc}", file=sys.stderr)
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", code],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except TimeoutExpired:
+        print(f"Interpreter timed out after {timeout} seconds.", file=sys.stderr)
+        return
+    except OSError as exc:
+        print(f"Failed to launch interpreter: {exc}", file=sys.stderr)
+        return
+
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="")
+    if result.returncode != 0:
+        print(f"Interpreter exited with status {result.returncode}", file=sys.stderr)
 
 
 def main() -> None:
@@ -221,6 +230,11 @@ def main() -> None:
         model = CODER_MODEL
         system_prompt = CODER_SYSTEM_PROMPT if args.system_prompt is None else args.system_prompt
 
+    print(
+        f"[client] Sending request to {args.host} for model '{model}' "
+        f"with timeout {args.timeout}s.",
+        file=sys.stderr,
+    )
     try:
         result = generate(
             host=args.host,
@@ -237,6 +251,10 @@ def main() -> None:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
+        print(
+            f"[client] Received response payload with keys: {', '.join(result.keys())}.",
+            file=sys.stderr,
+        )
         response_text: Optional[str] = result.get("response")
         if response_text is None:
             print("No response field found in Ollama output.", file=sys.stderr)
@@ -245,12 +263,27 @@ def main() -> None:
         output = response_text.strip()
         warning: Optional[str] = None
         if args.coder:
+            print("[client] Enforcing coder mode output validation.", file=sys.stderr)
             output, warning = ensure_pure_python(output)
             if warning:
                 print(warning, file=sys.stderr)
+        else:
+            print(
+                "[client] No coder validation requested; returning raw model response.",
+                file=sys.stderr,
+            )
         print(output)
         if args.execute:
-            execute_python(output)
+            print(
+                f"[client] Executing generated code with timeout {args.timeout}s.",
+                file=sys.stderr,
+            )
+            execute_python(output, timeout=args.timeout)
+        else:
+            print(
+                "[client] Execution not requested (use --execute to run the code).",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":
