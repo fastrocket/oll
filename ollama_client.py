@@ -4,14 +4,23 @@ Simple Ollama client for interacting with a locally running Ollama server.
 
 Usage example:
     python ollama_client.py --prompt "Hello!" --temperature 0.7
+    python ollama_client.py --coder --prompt "write a function to add two ints"
 """
 
 import argparse
+import ast
 import json
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import requests
+
+CODER_MODEL = "qwen2.5-coder:14b"
+CODER_SYSTEM_PROMPT = (
+    "You are the world's sharpest Python code generator. "
+    "Respond with valid, ready-to-run Python source code only. "
+    "Do not include explanations, comments, markdown, or backticks—only the code."
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,6 +108,23 @@ def parse_args() -> argparse.Namespace:
         default=120.0,
         help="HTTP request timeout in seconds.",
     )
+    parser.add_argument(
+        "--system-prompt",
+        default=None,
+        help="Optional system prompt to send with the request.",
+    )
+    parser.add_argument(
+        "--coder",
+        action="store_true",
+        help=(
+            f"Shortcut for --model {CODER_MODEL} with a system prompt that enforces pure Python output."
+        ),
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute the returned Python code in a simple sandbox (use with caution).",
+    )
     return parser.parse_args()
 
 
@@ -123,6 +149,7 @@ def generate(
     prompt: str,
     options: Dict[str, Any],
     timeout: float,
+    system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     url = f"{host.rstrip('/')}/api/generate"
     payload = {
@@ -131,21 +158,77 @@ def generate(
         "options": options,
         "stream": False,
     }
+    if system_prompt:
+        payload["system"] = system_prompt
 
     response = requests.post(url, json=payload, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
 
+def _extract_code_block(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    # Drop the opening fence
+    lines = lines[1:]
+    # Remove optional language hint from opening fence handled above
+    if lines and lines[0].lower().startswith("python"):
+        lines = lines[1:]
+    # Trim closing fence if present
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def ensure_pure_python(text: str) -> Tuple[str, Optional[str]]:
+    code = _extract_code_block(text)
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        return code, f"Generated code failed to parse as Python: {exc}"
+    if "```" in code or code.strip().startswith("#"):
+        return code, "Generated output may contain non-code elements."
+    return code, None
+
+
+def execute_python(code: str) -> None:
+    # Minimal sandbox: provide a curated set of safe builtins.
+    safe_builtins = {
+        "print": print,
+        "range": range,
+        "len": len,
+        "enumerate": enumerate,
+        "sum": sum,
+        "min": min,
+        "max": max,
+        "abs": abs,
+    }
+    env: Dict[str, Any] = {"__builtins__": safe_builtins}
+    try:
+        exec(code, env, env)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Execution error: {exc}", file=sys.stderr)
+
+
 def main() -> None:
     args = parse_args()
+    model = args.model
+    system_prompt = args.system_prompt
+
+    if args.coder:
+        model = CODER_MODEL
+        system_prompt = CODER_SYSTEM_PROMPT if args.system_prompt is None else args.system_prompt
+
     try:
         result = generate(
             host=args.host,
-            model=args.model,
+            model=model,
             prompt=args.prompt,
             options=build_options(args),
             timeout=args.timeout,
+            system_prompt=system_prompt,
         )
     except requests.exceptions.RequestException as exc:
         print(f"Request to Ollama server failed: {exc}", file=sys.stderr)
@@ -159,7 +242,15 @@ def main() -> None:
             print("No response field found in Ollama output.", file=sys.stderr)
             print(json.dumps(result, indent=2))
             sys.exit(2)
-        print(response_text.strip())
+        output = response_text.strip()
+        warning: Optional[str] = None
+        if args.coder:
+            output, warning = ensure_pure_python(output)
+            if warning:
+                print(warning, file=sys.stderr)
+        print(output)
+        if args.execute:
+            execute_python(output)
 
 
 if __name__ == "__main__":
